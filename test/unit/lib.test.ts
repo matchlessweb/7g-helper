@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { analyze } from '../../src/lib/analyze.ts'
-import { buildException, nginxRegex } from '../../src/lib/exception.ts'
+import { buildException, MAX_VARIABLE_NAME, nginxRegex, paramsAround } from '../../src/lib/exception.ts'
 import { parseLogLine } from '../../src/lib/logline.ts'
 import { nginxUnquote, parseMappings } from '../../src/lib/rules.ts'
 
@@ -74,9 +74,12 @@ test('the Rank Math exception, in full', () => {
   assert.ok(r.ok)
   const site = buildException(r.line, r.matches, 'site', '2026-10-21')
   assert.equal(site.path, '/var/www/example.org/nginx/allow-rankmath-v1-gethead-7g-context.conf')
-  assert.match(site.content, /^set \$allow7g_rankmath_v1_gethead_bad_request_15 "";$/m)
-  assert.match(site.content, /^if \(\$request_uri ~ "\^\/wp-json\/rankmath\/v1\/getHead\(\\\?\|\$\)"\) \{$/m)
-  assert.match(site.content, /^if \(\$bad_request_7g = \$allow7g_rankmath_v1_gethead_bad_request_15\) \{\n {4}set \$7g_drop_bad_request 0;\n\}$/m)
+  assert.match(site.content, /^set \$allow7g_rankmath_v1_gethead_request_15 "";$/m)
+  assert.ok(
+    site.content.includes('if ($request_uri ~ "^/wp-json/rankmath/v1/getHead\\?(.*&)?url=https://example\\.org(&|$)") {\n'),
+    site.content,
+  )
+  assert.match(site.content, /^if \(\$bad_request_7g = \$allow7g_rankmath_v1_gethead_request_15\) \{\n {4}set \$7g_drop_bad_request 0;\n\}$/m)
   assert.equal(site.testAllowed, `curl -s -o /dev/null -w '%{http_code}\\n' 'https://example.org/wp-json/rankmath/v1/getHead?url=https://example.org'`)
   const server = buildException(r.line, r.matches, 'server', '2026-10-21')
   assert.equal(server.path, '/etc/nginx/extra.d/allow-rankmath-v1-gethead-7g-context.conf')
@@ -103,7 +106,7 @@ test('bot exceptions name the crawler', () => {
   const f = buildException(fb.line, fb.matches, 'site', '2026-10-21')
   assert.equal(f.fileName, 'allow-facebook-7g-context.conf')
   assert.match(f.content, /\$http_user_agent ~\* "facebookexternalhit"/)
-  assert.match(f.content, /if \(\$bad_bot_7g = \$allow7g_facebook_bad_bot_6\)/)
+  assert.match(f.content, /if \(\$bad_bot_7g = \$allow7g_facebook_bot_6\)/)
   assert.match(f.testStillBlocked, /-A 'BLEXBot'/)
   const gpt = ok.find((r) => r.ok && /GPTBot/.test(r.line.userAgent))!
   assert.ok(gpt.ok)
@@ -133,4 +136,98 @@ test('a short line, as GridPane docs print it, still reads; with no user agent t
   const bf = buildException(bot.line, bot.matches, 'site', 'x')
   assert.doesNotMatch(bf.content, /http_user_agent/)
   assert.match(bf.content, /\$request_uri ~ "\^\/x\(\\\?\|\$\)"/)
+})
+
+// The ways an exception file was seen to pass nginx -t and still not work (Matchless Fleet, 2026-11-24), and one this
+// tool had: a variable nginx -t refuses. test/unit/nginx.test.ts proves each in real nginx; these run without Docker.
+const OAUTH = '[24/Nov/2026:19:52:04 +0000] [":bad_querystring_10::bad_request_15:"] 203.0.113.50 example.com "GET /?redirect_uri=http://localhost:8080/callback HTTP/2.0" 403 0.000 "-" "curl/8.7.1"'
+const oauth = analyze(OAUTH, groups)[0]
+
+/** Problems with a file's variables and blocks, as nginx would read them. Empty means none found. */
+function fileProblems(content: string, hits: { group: string; number: number }[]): string[] {
+  const problems: string[] = []
+  // 1. In an expression, $7g_x is the regex capture $7 then the text "g_x": the right side of = and quoted strings.
+  for (const m of content.matchAll(/^if \(\$\S+ != ?(\S+)\) \{$|^if \(\$\S+ = (\S+)\) \{$/gm)) {
+    const rhs = m[1] ?? m[2]
+    if (!/^\$(\{[A-Za-z_]|[A-Za-z_])/.test(rhs)) problems.push(`compares with ${rhs}, which nginx reads as a capture`)
+  }
+  for (const m of content.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    if (/(?<!\\)\$[0-9]/.test(m[1]) && !/^\^|~/.test(m[1])) problems.push(`string "${m[1]}" holds a capture reference`)
+  }
+  // 4. A name over MAX_VARIABLE_NAME fails nginx -t.
+  for (const m of content.matchAll(/^set \$(\S+) /gm)) {
+    if (m[1].length > MAX_VARIABLE_NAME) problems.push(`$${m[1]} is ${m[1].length} characters: nginx -t fails`)
+  }
+  // 2. Every fired rule needs its own block, comparing its own map value and lifting its own flag.
+  const flag = { bad_bot: 'bot', bad_referer: 'referer', bad_querystring: 'query_string', bad_request: 'request', not_allowed_method: 'method' } as Record<string, string>
+  for (const h of hits) {
+    const map = h.group === 'not_allowed_method' ? 'not_allowed_method_7g' : `${h.group}_7g`
+    const re = new RegExp(`^if \\(\\$${map} = \\$\\S+\\) \\{\\n {4}set \\$7g_drop_bad_${flag[h.group]} 0;\\n\\}$`, 'm')
+    if (!re.test(content)) problems.push(`no block lifts ${h.group} rule ${h.number}`)
+    if (!new RegExp(`^ {4}set \\$\\S+ ${h.number};$`, 'm').test(content)) problems.push(`nothing sets ${h.number} for ${h.group}`)
+  }
+  return problems
+}
+
+test('faults 1, 2 and 4: letter-led short variables, one block per fired rule, on every sample', () => {
+  assert.ok(oauth.ok)
+  for (const r of [...ok, oauth]) {
+    if (!r.ok) continue
+    const file = buildException(r.line, r.matches, 'site', 'x')
+    assert.deepEqual(fileProblems(file.content, r.line.hits), [], file.content)
+    assert.equal((file.content.match(/^set \$\S+ "";$/gm) ?? []).length, r.line.hits.length, 'one block per fired rule')
+  }
+  // Controls: the checker finds each fault when it is put back.
+  const good = buildException(oauth.line, oauth.matches, 'site', 'x').content
+  assert.ok(fileProblems(good.replaceAll('$allow7g_', '$7g_allow_'), oauth.line.hits).some((p) => /capture/.test(p)))
+  assert.ok(fileProblems(good.split('\n\nset ')[0], oauth.line.hits).some((p) => /bad_request rule 15/.test(p)))
+  assert.ok(fileProblems(good.replaceAll('$allow7g_redirect_uri_', `$allow7g_${'x'.repeat(30)}_`), oauth.line.hits).some((p) => /nginx -t fails/.test(p)))
+})
+
+test('fault 3: a rule set off in the query pins that parameter and the path, never the path alone', () => {
+  assert.ok(oauth.ok)
+  const content = buildException(oauth.line, oauth.matches, 'site', 'x').content
+  const conds = conditions(content)
+  assert.equal(conds.length, 2)
+  const passes = (uri: string, c = conds) => c.map((x) => x.variable === 'request_uri' && x.regex.test(uri))
+  assert.deepEqual(passes('/?redirect_uri=http://localhost:8080/callback'), [true, true])
+  assert.deepEqual(passes('/?state=abc&redirect_uri=http://localhost:8080/callback&scope=x'), [true, true])
+  for (const near of [
+    '/?redirect_uri=http://localhost:9999/other',
+    '/?redirect_uri=http://localhost:8080/callbackX',
+    '/?xredirect_uri=http://localhost:8080/callback',
+    '/sample-page/?redirect_uri=http://localhost:8080/callback',
+    '/?q=localhost',
+    '/',
+  ]) {
+    assert.deepEqual(passes(near), [false, false], near)
+  }
+  // Control: the path-only pattern this tool wrote before lets the near misses through.
+  const old = conditions(content.replace(/~ "\^\/\\\?\(\.\*&\)\?redirect_uri=[^"]*"/g, '~ "^/(\\?|$)"'))
+  assert.deepEqual(passes('/?redirect_uri=http://localhost:9999/other', old), [true, true])
+
+  // Every sample whose rule fired in the query: the logged parameter, changed by one character, no longer matches.
+  for (const r of ok) {
+    if (!r.ok || !r.line.queryString) continue
+    for (const c of conditions(buildException(r.line, r.matches, 'site', 'x').content)) {
+      if (c.variable !== 'request_uri') continue
+      assert.ok(c.regex.test(r.line.uri), `${c.regex} vs ${r.line.uri}`)
+      assert.ok(!c.regex.test(`${r.line.path}?zz=1`), `${c.regex}: the path alone`)
+    }
+  }
+  const rm = ok.find((r) => r.ok && r.line.path === '/wp-json/rankmath/v1/getHead')!
+  assert.ok(rm.ok)
+  const [c] = conditions(buildException(rm.line, rm.matches, 'site', 'x').content)
+  assert.ok(c.regex.test('/wp-json/rankmath/v1/getHead?url=https://example.org'))
+  assert.ok(!c.regex.test('/wp-json/rankmath/v1/getHead?url=https://evil.example'))
+  assert.ok(!c.regex.test('/wp-json/rankmath/v1/getHead?url=https://example.org.evil.example'))
+})
+
+test('paramsAround takes whole parameters', () => {
+  const q = 'a=1&redirect_uri=http://localhost:8080/cb&b=2'
+  const at = q.indexOf('localhost')
+  assert.equal(paramsAround(q, at, at + 9), 'redirect_uri=http://localhost:8080/cb')
+  assert.equal(paramsAround(q, 0, 1), 'a=1')
+  assert.equal(paramsAround(q, q.length - 1, q.length), 'b=2')
+  assert.equal(paramsAround(q, 2, 6), 'a=1&redirect_uri=http://localhost:8080/cb')
 })
