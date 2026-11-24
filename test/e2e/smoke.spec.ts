@@ -57,7 +57,7 @@ test('paste a line, see the rule, copy the file', async ({ page, context }) => {
 
   const file = page.getByTestId('exception-file')
   await expect(file).toContainText('set $7g_drop_bad_request 0;')
-  await expect(file).toContainText('if ($bad_request_7g = $allow7g_rankmath_v1_gethead_bad_request_15)')
+  await expect(file).toContainText('if ($bad_request_7g = $allow7g_rankmath_v1_gethead_request_15)')
   await expect(page.getByTestId('exception-path')).toHaveText(
     '/var/www/example.org/nginx/allow-rankmath-v1-gethead-7g-context.conf',
   )
@@ -137,6 +137,6 @@ test('a custom-list rule offers to take the crawler off the list, and the except
   await expect(fix).toContainText('s/\\|facebookexternalhit\\)/)/I')
   await expect(fix).toContainText('/root/$(basename "$f").bak-')
   await expect(page.getByRole('heading', { name: 'Or keep the list: the exception file', exact: true })).toBeVisible()
-  await expect(page.getByTestId('exception-file')).toContainText('if ($bad_bot_7g = $allow7g_facebook_bad_bot_6)')
+  await expect(page.getByTestId('exception-file')).toContainText('if ($bad_bot_7g = $allow7g_facebook_bot_6)')
   expect(problems).toEqual([])
 })

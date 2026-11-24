@@ -60,9 +60,52 @@ interface Condition {
   slug: string
 }
 
+/** The whole query-string parameters ("name=value", split on &) that hold query[start, end), as one literal. */
+export function paramsAround(query: string, start: number, end: number): string {
+  const from = start > 0 ? query.lastIndexOf('&', start - 1) + 1 : 0
+  const amp = query.indexOf('&', Math.max(end, start + 1))
+  return query.slice(from, amp === -1 ? query.length : amp)
+}
+
+function pathSlug(path: string): string {
+  return slugify(path.split('/').filter(Boolean).slice(-3).join('-'), 32)
+}
+
+// Query-string and request rules. Both are tested against $request_uri, the address exactly as sent with its query:
+// its query part is byte for byte what the query-string map reads ($query_string), and the path can be pinned in the
+// same test. A rule's number alone is not enough scope: nginx's map stops at its first match, so lifting rule N for
+// a whole address would also skip every later rule in that group for any query sent there. So the pattern pins the
+// parameter that set the rule off, whole, and the path; never the path alone when the match was in the query.
+function addressCondition(m: RuleMatch, line: LogLine): Condition {
+  const path = line.path || '/'
+  const uri = line.uri || path
+  const exact = (): Condition => ({
+    test: `$request_uri ~ "^${nginxRegex(uri)}$"`,
+    says: `exactly ${uri}`,
+    slug: path === '/' ? slugify(line.queryString.split('=')[0], 24) : pathSlug(path),
+  })
+  if (!m.matched) return exact()
+  // Where the match sits, as offsets into the query string (negative: inside the path; -1 is the "?").
+  const queryAt = m.hit.group === 'bad_querystring' ? 0 : path.length + 1
+  const start = m.matched.index - queryAt
+  const end = start + m.matched.text.length
+  if (m.hit.group === 'bad_request' && end <= -1) {
+    // The path itself set the rule off: that one path, with or without a query (the query-string rules still check it).
+    return { test: `$request_uri ~ "^${nginxRegex(path)}(\\?|$)"`, says: `requests to ${path}`, slug: pathSlug(path) }
+  }
+  if (start < 0 || !uri.includes('?')) return exact()
+  const param = paramsAround(line.queryString, start, end)
+  return {
+    test: `$request_uri ~ "^${nginxRegex(path)}\\?(.*&)?${nginxRegex(param)}(&|$)"`,
+    says: `requests to ${path} carrying ${param}`,
+    slug: path === '/' ? slugify(param.split('=')[0], 24) : pathSlug(path),
+  }
+}
+
 function condition(m: RuleMatch, line: LogLine): Condition {
   // Without the user agent or referrer in the line, the only safe scope left is the address.
   const group = (m.hit.group === 'bad_bot' && !line.userAgent) || (m.hit.group === 'bad_referer' && !line.referer) ? 'path' : m.hit.group
+  if (group === 'bad_querystring' || group === 'bad_request') return addressCondition(m, line)
   switch (group) {
     case 'bad_bot': {
       const text = m.matched?.text
@@ -92,6 +135,32 @@ function condition(m: RuleMatch, line: LogLine): Condition {
   }
 }
 
+const GROUP_SHORT: Record<RuleMatch['hit']['group'], string> = {
+  bad_bot: 'bot',
+  bad_referer: 'referer',
+  bad_querystring: 'query',
+  bad_request: 'request',
+  not_allowed_method: 'method',
+}
+
+/**
+ * nginx -t fails ("could not build variables_hash") on a variable name longer than this, at nginx's default
+ * variables_hash_bucket_size of 64, which GridPane keeps. Measured on nginx 1.30: 46 characters pass, 47 fail.
+ */
+export const MAX_VARIABLE_NAME = 46
+
+/**
+ * The exception's own variable. It starts with a letter: in an nginx expression, $7g_x is read as the regex capture
+ * $7 followed by the text "g_x", so a comparison with it never matches.
+ */
+export function exceptionVariable(slug: string, group: RuleMatch['hit']['group'], number: number): string {
+  const tail = `_${GROUP_SHORT[group]}_${number}`
+  const room = MAX_VARIABLE_NAME - 'allow7g_'.length - tail.length
+  const name = `allow7g_${slug.replace(/-/g, '_').slice(0, Math.min(20, Math.max(0, room))).replace(/_+$/, '')}${tail}`.replace('allow7g__', 'allow7g_')
+  if (name.length > MAX_VARIABLE_NAME) throw new Error(`variable name too long for nginx: ${name}`)
+  return `$${name}`
+}
+
 export function buildException(line: LogLine, matches: RuleMatch[], scope: Scope, today: string): ExceptionFile {
   const conds = matches.map((m) => ({ m, c: condition(m, line) }))
   const slug = [...new Set(conds.map(({ c }) => c.slug))].join('-').slice(0, 48).replace(/-+$/, '')
@@ -106,7 +175,11 @@ export function buildException(line: LogLine, matches: RuleMatch[], scope: Scope
     ...conds.map(
       ({ m, c }) => `# Lets through ${c.says}, only when ${m.hit.group} rule ${m.hit.number} is what blocked it.`,
     ),
-    `# Every other 7G rule stays on for ${conds.length > 1 ? 'these requests' : 'this request'}, and ${conds.length > 1 ? 'these rules stay' : 'this rule stays'} on for everything else.`,
+    `# ${conds.length > 1 ? 'These rules stay' : 'This rule stays'} on for everything else, and the other 7G rule groups still check these requests.`,
+    '# nginx stops reading a rule group at its first match, so for a request let through here, the rules after the named',
+    '# one in that group are skipped too. That is why the pattern is pinned as tightly as the logged request allows.',
+    '# If part of a pinned value changes from one request to the next (a port, a page address, a token), this file will',
+    '# not match the next request. Widen only that part by hand, for example with [^&]*, and test both ways again.',
     scope === 'site'
       ? `# Applies to ${site} only.`
       : '# Applies to every 7G-enabled site on this server.',
@@ -117,7 +190,7 @@ export function buildException(line: LogLine, matches: RuleMatch[], scope: Scope
   ]
 
   const blocks = conds.map(({ m, c }) => {
-    const variable = `$allow7g_${c.slug.replace(/-/g, '_')}_${m.hit.group}_${m.hit.number}`
+    const variable = exceptionVariable(c.slug, m.hit.group, m.hit.number)
     return [
       `set ${variable} "";`,
       `if (${c.test}) {`,
