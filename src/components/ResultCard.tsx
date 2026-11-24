@@ -305,7 +305,9 @@ export function ResultCard({ result }: { result: LineResult }) {
             <h2>The exception file</h2>
             <p>
               It lets this one request shape through, only when {several ? 'these rules are' : 'this rule is'} what
-              blocked it. The rest of 7G stays on.
+              blocked it. Other 7G groups still check the request. Within {several ? 'these groups' : 'this group'}, a
+              request that matches this shape skips the group’s other rules, so the file pins the shape as narrowly as
+              it can.
             </p>
             <ExceptionPanel result={result} />
           </>

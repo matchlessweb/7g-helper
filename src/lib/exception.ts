@@ -1,5 +1,7 @@
 // The exception file, in the strict form: it lets one request shape through only when the rule that fired is the
-// one in the log. Every other 7G rule stays on for that request, and that rule stays on for every other request.
+// one in the log. That rule stays on for every other request, and the other 7G groups still check this one. Within
+// the rule's own group, a matching request skips the group's other rules (nginx stops at the first match), which is
+// why the pattern pins the request as narrowly as it can.
 // GridPane includes these files after the maps set the drop flags and before it drops the request, and keeps them
 // through its updates: per site /var/www/<site>/nginx/*-7g-context.conf, server-wide /etc/nginx/extra.d/*7g-context.conf.
 

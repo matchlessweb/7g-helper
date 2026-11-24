@@ -146,7 +146,7 @@ const FAQ: { q: string; a: React.ReactNode }[] = [
   },
   {
     q: 'Why not turn the rule group off?',
-    a: 'Turning a group off drops every rule in it, for every request to the site. The exception drops one rule, for one address or one crawler, and only when that rule is what fired. Everything else 7G checks stays on.',
+    a: 'Turning a group off drops every rule in it, for every request to the site. The exception drops one rule, for one address or one crawler, and only when that rule is what fired. Other groups still check every request. One limit: a request that matches the exception also skips the rest of that rule’s group, so the file pins the request as narrowly as it can.',
   },
   {
     q: 'The rule number is not in GridPane’s list. What does that mean?',
